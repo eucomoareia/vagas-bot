@@ -444,12 +444,13 @@ def header(jobs, today):
 
 
 # --- Discord ---------------------------------------------------------------
-def discord(url, method="POST", payload=None):
-    """Chama o webhook com retry em caso de rate limit (429)."""
+def discord(url, method="POST", payload=None, headers=None):
+    """Chama a API do Discord com retry em caso de rate limit (429)."""
     data = json.dumps(payload).encode() if payload is not None else None
     for _ in range(5):
         req = urllib.request.Request(url, data=data, method=method,
-                                     headers={"Content-Type": "application/json", "User-Agent": UA})
+                                     headers={"Content-Type": "application/json", "User-Agent": UA,
+                                              **(headers or {})})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 body = r.read()
@@ -465,6 +466,61 @@ def send(webhook, payload):
     """Envia e devolve o ID da mensagem (wait=true faz o Discord responder com ela)."""
     sep = "&" if "?" in webhook else "?"
     return discord(f"{webhook}{sep}wait=true", payload=payload)["id"]
+
+
+class Bot:
+    """Envio pelo bot do Discord: permite botões nos cards (o webhook comum não permite)."""
+    API = "https://discord.com/api/v10"
+
+    def __init__(self, token, channel):
+        self.auth = {"Authorization": f"Bot {token}"}
+        self.channel = channel
+
+    def call(self, path, method="POST", payload=None):
+        return discord(f"{self.API}{path}", method, payload, self.auth)
+
+    def send(self, payload):
+        return self.call(f"/channels/{self.channel}/messages", payload=payload)["id"]
+
+    def clean(self):
+        """Apaga todas as mensagens de bots/webhooks do canal (inclusive as antigas do webhook)."""
+        ids, before = [], None
+        while True:
+            q = "limit=100" + (f"&before={before}" if before else "")
+            msgs = self.call(f"/channels/{self.channel}/messages?{q}", "GET")
+            if not msgs:
+                break
+            ids += [m["id"] for m in msgs if m["author"].get("bot") or m.get("webhook_id")]
+            before = msgs[-1]["id"]
+        # bulk-delete só aceita mensagens com menos de 14 dias
+        cutoff = (int(time.time() * 1000) - 1420070400000 - 13 * 86400 * 1000) << 22
+        recent = [i for i in ids if int(i) > cutoff]
+        old = [i for i in ids if int(i) <= cutoff]
+        for k in range(0, len(recent), 100):
+            part = recent[k:k + 100]
+            if len(part) == 1:
+                old += part
+            else:
+                self.call(f"/channels/{self.channel}/messages/bulk-delete", payload={"messages": part})
+        for i in old:
+            self.call(f"/channels/{self.channel}/messages/{i}", "DELETE")
+            time.sleep(0.5)
+        MESSAGES_FILE.write_text("[]")
+        print(f"{len(ids)} mensagem(ns) apagada(s)")
+
+
+def buttons(j):
+    # Os cliques são tratados em discord-botoes/worker.js
+    row = [{"type": 2, "style": 3, "label": "Me candidatei", "emoji": {"name": "✅"}, "custom_id": "aplicar"},
+           {"type": 2, "style": 4, "label": "Sem interesse", "emoji": {"name": "🗑️"}, "custom_id": "ignorar"}]
+    if len(j["url"]) <= 512:
+        row.append({"type": 2, "style": 5, "label": "Abrir vaga", "url": j["url"]})
+    return [{"type": 1, "components": row}]
+
+
+def get_bot():
+    token, channel = os.getenv("DISCORD_BOT_TOKEN"), os.getenv("DISCORD_CHANNEL_ID")
+    return Bot(token, channel) if token and channel else None
 
 
 def load_messages():
@@ -494,9 +550,12 @@ def main():
     ap.add_argument("--limpar", action="store_true", help="apaga do canal as mensagens enviadas pelo bot")
     args = ap.parse_args()
 
+    bot = get_bot()
     if args.limpar:
-        webhook = os.getenv("DISCORD_WEBHOOK_URL") or sys.exit("Defina DISCORD_WEBHOOK_URL")
-        clean(webhook)
+        if bot:
+            bot.clean()
+        else:
+            clean(os.getenv("DISCORD_WEBHOOK_URL") or sys.exit("Defina DISCORD_WEBHOOK_URL"))
         return
 
     seen = set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
@@ -513,19 +572,27 @@ def main():
         return
 
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
-    if not webhook:
-        sys.exit("Defina DISCORD_WEBHOOK_URL")
+    if not bot and not webhook:
+        sys.exit("Defina DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID (com botões) ou DISCORD_WEBHOOK_URL")
     if not new:
         return
     sent, msg_ids = set(), []
     try:
-        msg_ids.append(send(webhook, {"content": header(new, today)}))
-        for i in range(0, len(new), 10):  # máx. 10 embeds por mensagem
-            chunk = new[i:i + 10]
-            embeds = [embed(j, i + k + 1, len(new), today) for k, j in enumerate(chunk)]
-            msg_ids.append(send(webhook, {"embeds": embeds}))
-            sent |= {j["id"] for j in chunk}
-            time.sleep(1.5)
+        if bot:
+            # Uma mensagem por vaga, cada uma com seus botões
+            msg_ids.append(bot.send({"content": header(new, today)}))
+            for n, j in enumerate(new, 1):
+                msg_ids.append(bot.send({"embeds": [embed(j, n, len(new), today)], "components": buttons(j)}))
+                sent.add(j["id"])
+                time.sleep(1.1)
+        else:
+            msg_ids.append(send(webhook, {"content": header(new, today)}))
+            for i in range(0, len(new), 10):  # máx. 10 embeds por mensagem
+                chunk = new[i:i + 10]
+                embeds = [embed(j, i + k + 1, len(new), today) for k, j in enumerate(chunk)]
+                msg_ids.append(send(webhook, {"embeds": embeds}))
+                sent |= {j["id"] for j in chunk}
+                time.sleep(1.5)
     finally:
         # grava o que já foi enviado mesmo se der erro no meio
         if msg_ids:

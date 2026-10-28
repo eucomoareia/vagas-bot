@@ -1,0 +1,8 @@
+name = "vagas-bot-botoes"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+# Valores públicos do app (Discord Developer Portal > General Information)
+DISCORD_APP_ID = "PREENCHER"
+DISCORD_PUBLIC_KEY = "PREENCHER"
