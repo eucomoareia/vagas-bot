@@ -26,7 +26,9 @@ SEEN_FILE = HERE / "seen.json"
 MESSAGES_FILE = HERE / "messages.json"  # IDs das mensagens no Discord, para --limpar
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
 BRT = timezone(timedelta(hours=-3))
-DISCORD_UA = "DiscordBot (https://github.com/eucomoareia/vagas-bot, 1.0)"  # a API de bots recusa UA de navegador
+# Imagem transparente servida pelo Worker; deixa todos os cards com a mesma largura
+SPACER_URL = os.getenv("SPACER_URL", "https://vagas-bot-botoes.luispim2005.workers.dev/spacer.png")
+DISCORD_UA ="DiscordBot (https://github.com/eucomoareia/vagas-bot, 1.0)"  # a API de bots recusa UA de navegador
 
 # Termos usados nas fontes que aceitam busca por palavra-chave
 TERMS = ["java", "spring boot", "full stack", "fullstack", "desenvolvedor", "react",
@@ -414,23 +416,29 @@ def level(j):
     return j["level"] or "Júnior"
 
 
+def short(s, n):
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[:n - 1].rstrip() + "…"
+
+
 def embed(j, n, total, today):
+    """Card de tamanho fixo: sempre os mesmos 6 campos (grade 3x2), textos cortados e uma
+    imagem transparente larga que força todos os cards à mesma largura."""
     name, emoji, color = category(j)
+    loc = j["location"] if j["location"] not in ("", "Brasil", "Remoto (Brasil)") else "Brasil"
     fields = [
-        {"name": "📊 Nível", "value": level(j), "inline": True},
-        {"name": "🏠 Modelo", "value": "Remoto", "inline": True},
-        {"name": "🔎 Fonte", "value": j["source"].replace("GitHub ", "GitHub · "), "inline": True},
+        {"name": "📊 Nível", "value": level(j)},
+        {"name": "🛠️ Stack", "value": " · ".join(techs(j)[:3]) or "—"},
+        {"name": "📌 Status", "value": "🆕 Nova"},  # o Worker troca ao clicar nos botões
+        {"name": "🔎 Fonte", "value": "GitHub" if j["source"].startswith("GitHub") else j["source"]},
+        {"name": "📍 Local", "value": short(loc.split(",")[0], 22)},
+        {"name": "🏠 Modelo", "value": "Remoto"},
     ]
-    t = techs(j)
-    if t:
-        fields.insert(0, {"name": "🛠️ Stack", "value": " · ".join(t), "inline": False})
-    if j["location"] and j["location"] not in ("Brasil", "Remoto (Brasil)"):
-        fields.append({"name": "📍 Local", "value": j["location"][:100], "inline": True})
-    e = {"title": f"{emoji} {j['title']}"[:250], "url": j["url"], "color": color,
-         "fields": fields, "footer": {"text": f"{name} · vaga {n}/{total} · {today}"}}
-    if j["company"]:
-        e["author"] = {"name": f"🏢 {j['company']}"[:250]}
-    return e
+    return {"title": short(f"{emoji} {j['title']}", 70), "url": j["url"], "color": color,
+            "author": {"name": short(f"🏢 {j['company'] or 'Empresa não informada'}", 60)},
+            "fields": [{**f, "inline": True} for f in fields],
+            "image": {"url": SPACER_URL},
+            "footer": {"text": f"{name} · vaga {n}/{total} · {today}"}}
 
 
 def header(jobs, today):
@@ -513,7 +521,7 @@ class Bot:
 def buttons(j):
     # Os cliques são tratados em discord-botoes/worker.js
     row = [{"type": 2, "style": 3, "label": "Me candidatei", "emoji": {"name": "✅"}, "custom_id": "aplicar"},
-           {"type": 2, "style": 4, "label": "Sem interesse", "emoji": {"name": "🗑️"}, "custom_id": "ignorar"}]
+           {"type": 2, "style": 4, "label": "Sem interesse", "emoji": {"name": "❌"}, "custom_id": "ignorar"}]
     if len(j["url"]) <= 512:
         row.append({"type": 2, "style": 5, "label": "Abrir vaga", "url": j["url"]})
     return [{"type": 1, "components": row}]

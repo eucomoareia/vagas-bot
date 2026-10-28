@@ -1,12 +1,23 @@
 // Cloudflare Worker que recebe os cliques nos botões dos cards de vaga
 // (Interactions Endpoint URL do app no Discord).
-//   aplicar        -> card fica verde, marcado como "candidatura enviada"
+//   aplicar        -> card fica verde, status "Candidatei"
+//   ignorar        -> card fica vermelho, status "Sem interesse"
 //   desfazer:<cor> -> volta o card ao normal
-//   ignorar        -> apaga a mensagem
+// GET /spacer.png -> imagem transparente que deixa todos os cards com a mesma largura
 // Variáveis (wrangler.toml): DISCORD_PUBLIC_KEY, DISCORD_APP_ID
 
-const STATUS = "✅ Status";
-const PREFIX = "✅ CANDIDATADO · ";
+const STATUS = "📌 Status";
+const MARKS = /^(✅|❌) /;
+const STATES = {
+  aplicar: { mark: "✅", color: 0x2ecc71, status: (t) => `✅ Candidatei <t:${t}:d>` },
+  ignorar: { mark: "❌", color: 0xe74c3c, status: () => "❌ Sem interesse" },
+};
+
+// PNG 1000x1 transparente
+const SPACER = Uint8Array.from(
+  atob("iVBORw0KGgoAAAANSUhEUgAAA+gAAAABCAYAAABNAIQzAAAAG0lEQVR42u3BMQEAAADCoPVPbQwfoAAAAIC7AQ+hAAEipZISAAAAAElFTkSuQmCC"),
+  (c) => c.charCodeAt(0)
+);
 
 const hex = (s) => Uint8Array.from(s.match(/../g).map((h) => parseInt(h, 16)));
 
@@ -21,30 +32,38 @@ async function verify(req, body, publicKey) {
 const json = (data) => new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
 
 // Mesmos botões que o vagas_bot.py coloca no card
-function buttons(url, applied, color = 0) {
-  const row = applied
+function buttons(url, marked, color = 0) {
+  const row = marked
     ? [{ type: 2, style: 2, label: "Desfazer", emoji: { name: "↩️" }, custom_id: `desfazer:${color}` }]
     : [
         { type: 2, style: 3, label: "Me candidatei", emoji: { name: "✅" }, custom_id: "aplicar" },
-        { type: 2, style: 4, label: "Sem interesse", emoji: { name: "🗑️" }, custom_id: "ignorar" },
+        { type: 2, style: 4, label: "Sem interesse", emoji: { name: "❌" }, custom_id: "ignorar" },
       ];
   if (url) row.push({ type: 2, style: 5, label: "Abrir vaga", url });
   return [{ type: 1, components: row }];
 }
 
-function handleClick(i, env, ctx) {
+// Troca o valor do campo Status mantendo a posição (o card não muda de tamanho)
+function withStatus(fields, value) {
+  const out = fields.map((f) => (f.name === STATUS ? { ...f, value } : f));
+  return out.some((f) => f.name === STATUS) ? out : [...out, { name: STATUS, value, inline: true }];
+}
+
+function handleClick(i) {
   const id = i.data.custom_id;
   const embed = i.message.embeds?.[0] ?? {};
   const url = embed.url ?? "";
-  const fields = (embed.fields ?? []).filter((f) => f.name !== STATUS);
+  const title = (embed.title ?? "").replace(MARKS, "");
+  const fields = embed.fields ?? [];
 
-  if (id === "aplicar") {
-    const when = Math.floor(Date.now() / 1000);
+  const state = STATES[id];
+  if (state) {
+    const now = Math.floor(Date.now() / 1000);
     const updated = {
       ...embed,
-      title: (PREFIX + (embed.title ?? "")).slice(0, 256),
-      color: 0x2ecc71,
-      fields: [{ name: STATUS, value: `Candidatura enviada <t:${when}:R> (<t:${when}:d>)`, inline: false }, ...fields],
+      title: `${state.mark} ${title}`.slice(0, 256),
+      color: state.color,
+      fields: withStatus(fields, state.status(now)),
     };
     return json({ type: 7, data: { embeds: [updated], components: buttons(url, true, embed.color ?? 0) } });
   }
@@ -52,36 +71,27 @@ function handleClick(i, env, ctx) {
   if (id.startsWith("desfazer:")) {
     const restored = {
       ...embed,
-      title: (embed.title ?? "").replace(PREFIX, ""),
+      title,
       color: Number(id.split(":")[1]) || 0x5865f2,
-      fields,
+      fields: withStatus(fields, "🆕 Nova"),
     };
     return json({ type: 7, data: { embeds: [restored], components: buttons(url, false) } });
-  }
-
-  if (id === "ignorar") {
-    // Responde "ok" na hora e apaga a mensagem logo depois, usando o token da interação
-    ctx.waitUntil(
-      new Promise((r) => setTimeout(r, 500)).then(() =>
-        fetch(`https://discord.com/api/v10/webhooks/${env.DISCORD_APP_ID}/${i.token}/messages/@original`, {
-          method: "DELETE",
-        })
-      )
-    );
-    return json({ type: 6 });
   }
 
   return json({ type: 6 });
 }
 
 export default {
-  async fetch(req, env, ctx) {
+  async fetch(req, env) {
+    if (req.method === "GET" && new URL(req.url).pathname === "/spacer.png") {
+      return new Response(SPACER, { headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=31536000" } });
+    }
     if (req.method !== "POST") return new Response("ok");
     const body = await req.text();
     if (!(await verify(req, body, env.DISCORD_PUBLIC_KEY))) return new Response("assinatura inválida", { status: 401 });
     const i = JSON.parse(body);
     if (i.type === 1) return json({ type: 1 }); // PING de validação do Discord
-    if (i.type === 3) return handleClick(i, env, ctx); // clique em botão
+    if (i.type === 3) return handleClick(i); // clique em botão
     return json({ type: 6 });
   },
 };
