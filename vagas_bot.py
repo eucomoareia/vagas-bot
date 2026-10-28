@@ -21,6 +21,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SEEN_FILE = HERE / "seen.json"
+MESSAGES_FILE = HERE / "messages.json"  # IDs das mensagens no Discord, para --limpar
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
 
 # Termos usados nas fontes que aceitam busca por palavra-chave
@@ -314,18 +315,48 @@ def collect():
 
 
 # --- Discord ---------------------------------------------------------------
-def send(webhook, payload):
+def discord(url, method="POST", payload=None):
+    """Chama o webhook com retry em caso de rate limit (429)."""
+    data = json.dumps(payload).encode() if payload is not None else None
     for _ in range(5):
-        req = urllib.request.Request(webhook, data=json.dumps(payload).encode(),
+        req = urllib.request.Request(url, data=data, method=method,
                                      headers={"Content-Type": "application/json", "User-Agent": UA})
         try:
-            urllib.request.urlopen(req, timeout=30).read()
-            return
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read()
+            return json.loads(body) if body else None
         except urllib.error.HTTPError as e:
             if e.code != 429:
                 raise
             time.sleep(float(json.loads(e.read() or b"{}").get("retry_after", 2)) + 0.5)
     raise RuntimeError("Discord continuou limitando (429)")
+
+
+def send(webhook, payload):
+    """Envia e devolve o ID da mensagem (wait=true faz o Discord responder com ela)."""
+    sep = "&" if "?" in webhook else "?"
+    return discord(f"{webhook}{sep}wait=true", payload=payload)["id"]
+
+
+def load_messages():
+    return json.loads(MESSAGES_FILE.read_text()) if MESSAGES_FILE.exists() else []
+
+
+def clean(webhook):
+    """Apaga do canal todas as mensagens que o bot enviou (o webhook só apaga as próprias)."""
+    ids = load_messages()
+    left = []
+    for i, mid in enumerate(ids):
+        try:
+            discord(f"{webhook.split('?')[0]}/messages/{mid}", method="DELETE")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:  # 404 = já tinha sido apagada à mão
+                warn(f"não consegui apagar {mid}: {e}")
+                left.append(mid)
+        if i % 4 == 3:
+            time.sleep(1.5)
+    MESSAGES_FILE.write_text(json.dumps(left))
+    print(f"{len(ids) - len(left)} mensagem(ns) apagada(s)")
 
 
 def embed(j):
@@ -340,7 +371,13 @@ def embed(j):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--limpar", action="store_true", help="apaga do canal as mensagens enviadas pelo bot")
     args = ap.parse_args()
+
+    if args.limpar:
+        webhook = os.getenv("DISCORD_WEBHOOK_URL") or sys.exit("Defina DISCORD_WEBHOOK_URL")
+        clean(webhook)
+        return
 
     seen = set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
     new = [j for j in collect() if j["id"] not in seen]
@@ -354,18 +391,19 @@ def main():
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook:
         sys.exit("Defina DISCORD_WEBHOOK_URL")
-    sent = set()
+    sent, msg_ids = set(), []
     try:
         for i in range(0, len(new), 10):  # máx. 10 embeds por mensagem
             chunk = new[i:i + 10]
             content = f"🆕 **{len(new)} vaga(s) júnior remota(s) nova(s)**" if i == 0 else None
-            send(webhook, {"content": content, "embeds": [embed(j) for j in chunk]})
+            msg_ids.append(send(webhook, {"content": content, "embeds": [embed(j) for j in chunk]}))
             sent |= {j["id"] for j in chunk}
             time.sleep(1.5)
     finally:
         # grava o que já foi enviado mesmo se der erro no meio
         if sent:
             SEEN_FILE.write_text(json.dumps(sorted(seen | sent), indent=0))
+            MESSAGES_FILE.write_text(json.dumps(load_messages() + msg_ids))
 
 
 if __name__ == "__main__":
