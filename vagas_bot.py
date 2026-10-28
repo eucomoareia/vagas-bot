@@ -4,6 +4,7 @@
 Uso:
     DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... python3 vagas_bot.py
     python3 vagas_bot.py --dry-run     # só imprime, não envia nem grava histórico
+    python3 vagas_bot.py --limpar      # apaga do canal as mensagens enviadas pelo bot
 
 Só usa a biblioteca padrão. Vagas já enviadas ficam em seen.json (sem repetição).
 """
@@ -17,12 +18,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SEEN_FILE = HERE / "seen.json"
 MESSAGES_FILE = HERE / "messages.json"  # IDs das mensagens no Discord, para --limpar
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
+BRT = timezone(timedelta(hours=-3))
 
 # Termos usados nas fontes que aceitam busca por palavra-chave
 TERMS = ["java", "spring boot", "full stack", "fullstack", "desenvolvedor", "react",
@@ -55,6 +58,17 @@ SENIOR = re.compile(
     re.I,
 )
 BR_OK = re.compile(r"(brazil|brasil|latam|latin america|south america|americas|worldwide|anywhere|global)", re.I)
+# Modelo de trabalho
+NOT_REMOTE = re.compile(
+    r"(h[ií]brid|hybrid|presencial|on[\s-]?site|in[\s-]?office|"
+    r"dias? (no|na) (escrit|empresa|cliente|sede))",
+    re.I,
+)
+FULLY_REMOTE = re.compile(
+    r"(100\s*%\s*remot|totalmente remot|full[\s-]?remote|fully remote|remote[\s-]?first|"
+    r"100\s*%\s*home\s*office|trabalho 100\s*%|modelo remoto|regime remoto)",
+    re.I,
+)
 
 
 def get(url, headers=None, raw=False):
@@ -65,16 +79,18 @@ def get(url, headers=None, raw=False):
 
 
 def strip_html(s):
-    return html.unescape(re.sub(r"<[^>]+>", " ", s or ""))
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", s or "")).split())
 
 
 def job(source, title, url, company="", location="", extra="", text="", level_ok=False,
-        br_ok=True):
+        br_ok=True, remote_ok=False, level=""):
     """level_ok: a própria fonte já filtrou por júnior/estágio.
-    br_ok: a vaga já é sabidamente aberta a quem está no Brasil."""
+    br_ok: a vaga já é sabidamente aberta a quem está no Brasil.
+    remote_ok: a fonte garante que é 100% remota (senão o texto é checado)."""
     return {"id": url.split("?")[0].rstrip("/"), "source": source, "title": " ".join(title.split()),
             "company": (company or "").strip(), "url": url, "location": location or "",
-            "extra": extra or "", "text": text or "", "level_ok": level_ok, "br_ok": br_ok}
+            "extra": extra or "", "text": text or "", "level_ok": level_ok, "br_ok": br_ok,
+            "remote_ok": remote_ok, "level": level}
 
 
 def warn(msg):
@@ -107,9 +123,11 @@ def from_github():
                 lab = " ".join(labels)
                 if not re.search(r"remot", f"{it['title']} {lab}", re.I):
                     continue
+                if re.search(r"h[ií]brido|presencial|alocado", lab, re.I):
+                    continue
                 junior_label = any(re.search(r"j[uú]nior|estagi", l, re.I) for l in labels)
                 out.append(job(f"GitHub {repo}", it["title"], it["html_url"], location="Brasil",
-                               extra=lab, text=f"{lab} {(it.get('body') or '')[:800]}",
+                               extra=lab, text=f"{lab} {(it.get('body') or '')[:2000]}",
                                level_ok=junior_label))
             if len(issues) < 100:
                 break
@@ -117,7 +135,7 @@ def from_github():
 
 
 def from_remotar():
-    """remotar.com.br: só vagas remotas no Brasil."""
+    """remotar.com.br: vagas remotas no Brasil (algumas são híbridas: type == 'hybrid')."""
     out = []
     for term in TERMS:
         for page in range(1, 11):
@@ -128,12 +146,14 @@ def from_remotar():
                 warn(f"remotar {term}: {e}")
                 break
             for j in d.get("data", []):
+                if j.get("type") != "remote":
+                    continue
                 tags = " ".join((t.get("tag") or {}).get("name", "") for t in j.get("jobTags") or [])
                 company = (j.get("company") or {}).get("name") or j.get("companyDisplayName") or ""
                 url = j.get("externalLink") or f"https://remotar.com.br/job/{j['id']}"
                 out.append(job("Remotar", j["title"], url, company, "Remoto (Brasil)",
                                extra=j.get("subtitle") or "",
-                               text=f"{j.get('subtitle') or ''} {tags} {strip_html(j.get('description'))[:600]}",
+                               text=f"{j.get('subtitle') or ''} {tags} {strip_html(j.get('description'))[:2000]}",
                                level_ok=bool(re.search(r"j[uú]nior|est[aá]gi|trainee", tags, re.I))))
             if page >= d.get("meta", {}).get("last_page", 1):
                 break
@@ -143,29 +163,29 @@ def from_remotar():
 def from_programathor():
     out = []
     for skill in ("java", "spring", "react", "javascript", "typescript", "angular"):
-        for exp in ("Júnior",):
-            q = urllib.parse.urlencode({"expertise": exp, "remote": "true"})
-            try:
-                h = get(f"https://programathor.com.br/jobs-{skill}?{q}", raw=True)
-            except Exception as e:
-                warn(f"programathor {skill}: {e}")
+        q = urllib.parse.urlencode({"expertise": "Júnior", "remote": "true"})
+        try:
+            h = get(f"https://programathor.com.br/jobs-{skill}?{q}", raw=True)
+        except Exception as e:
+            warn(f"programathor {skill}: {e}")
+            continue
+        for m in re.finditer(r'href="(/jobs/\d+[^"]*)">(.*?)</a>', h, re.S):
+            card = m.group(2)
+            t = re.search(r"<h3[^>]*>(.*?)</h3>", card, re.S)
+            if not t or "Vencida" in card:
                 continue
-            for m in re.finditer(r'href="(/jobs/\d+[^"]*)">(.*?)</a>', h, re.S):
-                card = m.group(2)
-                t = re.search(r"<h3[^>]*>(.*?)</h3>", card, re.S)
-                if not t or "Vencida" in card:
-                    continue
-                spans = [strip_html(s).strip() for s in re.findall(r"<span>(.*?)</span>", card, re.S)]
-                if not any("remot" in s.lower() for s in spans):
-                    continue
-                out.append(job("ProgramaThor", strip_html(t.group(1)), "https://programathor.com.br" + m.group(1),
-                               spans[0] if spans else "", "Remoto (Brasil)",
-                               extra=" · ".join(spans[2:4]), level_ok=True))
+            spans = [strip_html(s) for s in re.findall(r"<span>(.*?)</span>", card, re.S)]
+            if not any("remot" in s.lower() for s in spans):
+                continue
+            out.append(job("ProgramaThor", strip_html(t.group(1)), "https://programathor.com.br" + m.group(1),
+                           spans[0] if spans else "", "Remoto (Brasil)",
+                           extra=" · ".join(spans[2:4]), level_ok=True, level="Júnior"))
     return out
 
 
 def from_linkedin():
-    """Busca pública (sem login) do LinkedIn: Brasil, remoto, estágio + júnior, últimos 30 dias."""
+    """Busca pública (sem login) do LinkedIn: Brasil, remoto, estágio + júnior, últimos 30 dias.
+    Os filtros do LinkedIn vazam, então cada vaga é conferida depois em linkedin_details()."""
     out = []
     for term in TERMS:
         for start in range(0, 100, 10):
@@ -193,6 +213,26 @@ def from_linkedin():
     return out
 
 
+def linkedin_details(j):
+    """Abre a vaga do LinkedIn e preenche nível e descrição. False = descartar."""
+    m = re.search(r"(\d{8,})$", j["id"])
+    if not m:
+        return True
+    try:
+        h = get(f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{m.group(1)}", raw=True)
+    except Exception as e:
+        warn(f"linkedin detalhe {m.group(1)}: {e}")
+        return True  # sem detalhe, confia no filtro de remoto da busca
+    crit = dict(re.findall(r'job-criteria-subheader">\s*(.*?)\s*<.*?job-criteria-text[^>]*>\s*(.*?)\s*<', h, re.S))
+    level = crit.get("Seniority level", "")
+    if re.search(r"mid-senior|director|executive", level, re.I):
+        return False
+    j["level"] = {"Entry level": "Entry level", "Internship": "Estágio"}.get(level, "")
+    d = re.search(r'show-more-less-html__markup[^>]*>(.*?)</div>', h, re.S)
+    j["text"] = strip_html(d.group(1) if d else "")[:4000]
+    return True
+
+
 # --- Fontes internacionais (filtradas por Brasil/LATAM) -------------------
 def from_himalayas():
     out = []
@@ -209,8 +249,8 @@ def from_himalayas():
             for j in jobs:
                 locs = ", ".join(j.get("locationRestrictions") or []) or "Worldwide"
                 out.append(job("Himalayas", j["title"], j["applicationLink"], j.get("companyName", ""),
-                               locs, extra=", ".join(j.get("seniority") or []),
-                               text=strip_html(j.get("excerpt")), level_ok=True))
+                               locs, text=strip_html(j.get("excerpt")), level_ok=True,
+                               remote_ok=True, level="Entry level"))
             if len(jobs) < 20:
                 break
     return out
@@ -228,9 +268,8 @@ def from_remotive():
         for j in d.get("jobs", []):
             loc = j.get("candidate_required_location", "")
             out.append(job("Remotive", j["title"], j["url"], j["company_name"], loc,
-                           extra=j.get("job_type", ""),
                            text=f"{' '.join(j.get('tags') or [])} {strip_html(j.get('description'))[:600]}",
-                           br_ok=bool(BR_OK.search(loc))))
+                           br_ok=bool(BR_OK.search(loc)), remote_ok=True))
     return out
 
 
@@ -245,9 +284,9 @@ def from_jobicy():
                 continue
             for j in d.get("jobs", []):
                 out.append(job("Jobicy", j["jobTitle"], j["url"], j.get("companyName", ""),
-                               j.get("jobGeo", ""), extra=j.get("jobLevel", ""),
+                               j.get("jobGeo", ""),
                                text=f"{j.get('jobLevel', '')} {strip_html(j.get('jobExcerpt'))}",
-                               br_ok=bool(BR_OK.search(j.get("jobGeo", "")))))
+                               br_ok=bool(BR_OK.search(j.get("jobGeo", ""))), remote_ok=True))
     return out
 
 
@@ -262,8 +301,8 @@ def from_remoteok():
         for j in d[1:]:
             loc = j.get("location") or ""
             out.append(job("RemoteOK", j.get("position", ""), j["url"], j.get("company", ""), loc,
-                           extra=", ".join(j.get("tags") or [])[:150],
-                           text=" ".join(j.get("tags") or []), br_ok=bool(BR_OK.search(loc))))
+                           text=" ".join(j.get("tags") or []), br_ok=bool(BR_OK.search(loc)),
+                           remote_ok=True))
         time.sleep(1)
     return out
 
@@ -274,6 +313,7 @@ SOURCES = [from_github, from_remotar, from_programathor, from_linkedin,
 
 # --- Filtragem -------------------------------------------------------------
 def matches(j):
+    """Filtro pelo título/fonte (barato, antes de abrir detalhes)."""
     title = j["title"]
     head = f"{title} {j['extra']} {j['text'][:400]}"
     if not j["br_ok"]:
@@ -287,10 +327,20 @@ def matches(j):
         return False
     if not j["level_ok"] and not JUNIOR.search(head):
         return False
+    if NOT_REMOTE.search(title) and not FULLY_REMOTE.search(title):
+        return False
     return True
 
 
-def collect():
+def is_remote(j):
+    """Descarta vagas cujo texto fala em híbrido/presencial sem dizer que é 100% remota."""
+    if j["remote_ok"]:
+        return True
+    text = f"{j['extra']} {j['text']}"
+    return not NOT_REMOTE.search(text) or bool(FULLY_REMOTE.search(text))
+
+
+def collect(seen):
     by_id = {}
     for src in SOURCES:
         try:
@@ -300,18 +350,97 @@ def collect():
             continue
         n = 0
         for j in jobs:
-            if j["id"] not in by_id and matches(j):
+            if j["id"] not in by_id and j["id"] not in seen and matches(j):
                 by_id[j["id"]] = j
                 n += 1
-        print(f"{src.__name__}: {len(jobs)} lidas, {n} aproveitadas", file=sys.stderr)
-    # Mesma vaga em fontes diferentes: dedupe por título+empresa
-    out, keys = [], set()
+        print(f"{src.__name__}: {len(jobs)} lidas, {n} candidatas", file=sys.stderr)
+
+    out, keys, dropped = [], set(), 0
     for j in by_id.values():
+        # Mesma vaga em fontes diferentes: dedupe por título+empresa
         k = (re.sub(r"\W+", "", j["title"].lower()), re.sub(r"\W+", "", j["company"].lower()))
-        if k not in keys:
-            keys.add(k)
-            out.append(j)
+        if k in keys:
+            continue
+        keys.add(k)
+        if j["source"] == "LinkedIn":
+            ok = linkedin_details(j)
+            time.sleep(0.7)
+            if not ok:
+                dropped += 1
+                continue
+        if not is_remote(j):
+            dropped += 1
+            continue
+        out.append(j)
+    print(f"{dropped} descartadas por não serem remotas/júnior após checar a descrição", file=sys.stderr)
     return out
+
+
+# --- Apresentação ----------------------------------------------------------
+# (nome, emoji, cor, regex) — a primeira que casar define a categoria
+CATEGORIES = [
+    ("Java", "☕", 0xE76F00, re.compile(r"java(?!script)|spring|kotlin", re.I)),
+    ("Full Stack", "🧩", 0x9B59B6, re.compile(r"full[\s-]?stack|fullstack", re.I)),
+    ("Front-end", "🎨", 0x3498DB, re.compile(r"front[\s-]?end|react|angular|vue", re.I)),
+    ("Back-end", "⚙️", 0x2ECC71, re.compile(r"back[\s-]?end|node|api", re.I)),
+    ("Dev geral", "💻", 0x95A5A6, re.compile(r".")),
+]
+TECHS = [("Java", r"java(?!script)"), ("Spring", r"spring"), ("Kotlin", r"kotlin"),
+         ("React", r"react"), ("Angular", r"angular"), ("Vue", r"\bvue"), ("Node", r"node"),
+         ("TypeScript", r"typescript"), ("JavaScript", r"javascript"), ("SQL", r"\bsql\b")]
+
+
+def category(j):
+    for name, emoji, color, rx in CATEGORIES:
+        if rx.search(j["title"]):
+            return name, emoji, color
+    return CATEGORIES[-1][:3]
+
+
+def techs(j):
+    blob = f"{j['title']} {j['extra']} {j['text'][:1500]}"
+    return [n for n, rx in TECHS if re.search(rx, blob, re.I)]
+
+
+def level(j):
+    t = j["title"]
+    if re.search(r"est[aá]gi|intern", t, re.I):
+        return "Estágio"
+    if re.search(r"trainee", t, re.I):
+        return "Trainee"
+    if re.search(r"j[uú]nior|\bjr\b", t, re.I):
+        return "Júnior"
+    return j["level"] or "Júnior"
+
+
+def embed(j, n, total, today):
+    name, emoji, color = category(j)
+    fields = [
+        {"name": "📊 Nível", "value": level(j), "inline": True},
+        {"name": "🏠 Modelo", "value": "Remoto", "inline": True},
+        {"name": "🔎 Fonte", "value": j["source"].replace("GitHub ", "GitHub · "), "inline": True},
+    ]
+    t = techs(j)
+    if t:
+        fields.insert(0, {"name": "🛠️ Stack", "value": " · ".join(t), "inline": False})
+    if j["location"] and j["location"] not in ("Brasil", "Remoto (Brasil)"):
+        fields.append({"name": "📍 Local", "value": j["location"][:100], "inline": True})
+    e = {"title": f"{emoji} {j['title']}"[:250], "url": j["url"], "color": color,
+         "fields": fields, "footer": {"text": f"{name} · vaga {n}/{total} · {today}"}}
+    if j["company"]:
+        e["author"] = {"name": f"🏢 {j['company']}"[:250]}
+    return e
+
+
+def header(jobs, today):
+    counts = {}
+    for j in jobs:
+        name, emoji, _ = category(j)
+        counts[(name, emoji)] = counts.get((name, emoji), 0) + 1
+    resumo = " · ".join(f"{e} {n}: **{c}**" for (n, e), c in counts.items())
+    return (f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 **{today} — {len(jobs)} vaga(s) júnior remota(s) nova(s)**\n{resumo}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━")
 
 
 # --- Discord ---------------------------------------------------------------
@@ -359,15 +488,6 @@ def clean(webhook):
     print(f"{len(ids) - len(left)} mensagem(ns) apagada(s)")
 
 
-def embed(j):
-    desc = f"**{j['company']}**\n" if j["company"] else ""
-    desc += f"📍 {j['location'] or 'Remoto'}"
-    if j["extra"]:
-        desc += f"\n🏷️ {j['extra'][:200]}"
-    return {"title": j["title"][:250], "url": j["url"], "description": desc,
-            "color": 0x5865F2, "footer": {"text": j["source"]}}
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -380,28 +500,35 @@ def main():
         return
 
     seen = set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
-    new = [j for j in collect() if j["id"] not in seen]
+    new = collect(seen)
+    order = [c[0] for c in CATEGORIES]
+    new.sort(key=lambda j: (order.index(category(j)[0]), j["title"].lower()))
     print(f"{len(new)} vaga(s) nova(s)")
+    today = datetime.now(BRT).strftime("%d/%m/%Y")
 
     if args.dry_run:
-        for j in new:
-            print(f"- [{j['source']}] {j['title']} | {j['company']} | {j['location']}\n  {j['url']}")
+        for n, j in enumerate(new, 1):
+            print(f"- {category(j)[1]} [{j['source']}] {j['title']} | {j['company']} | "
+                  f"{level(j)} | {', '.join(techs(j))}\n  {j['url']}")
         return
 
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook:
         sys.exit("Defina DISCORD_WEBHOOK_URL")
+    if not new:
+        return
     sent, msg_ids = set(), []
     try:
+        msg_ids.append(send(webhook, {"content": header(new, today)}))
         for i in range(0, len(new), 10):  # máx. 10 embeds por mensagem
             chunk = new[i:i + 10]
-            content = f"🆕 **{len(new)} vaga(s) júnior remota(s) nova(s)**" if i == 0 else None
-            msg_ids.append(send(webhook, {"content": content, "embeds": [embed(j) for j in chunk]}))
+            embeds = [embed(j, i + k + 1, len(new), today) for k, j in enumerate(chunk)]
+            msg_ids.append(send(webhook, {"embeds": embeds}))
             sent |= {j["id"] for j in chunk}
             time.sleep(1.5)
     finally:
         # grava o que já foi enviado mesmo se der erro no meio
-        if sent:
+        if msg_ids:
             SEEN_FILE.write_text(json.dumps(sorted(seen | sent), indent=0))
             MESSAGES_FILE.write_text(json.dumps(load_messages() + msg_ids))
 
