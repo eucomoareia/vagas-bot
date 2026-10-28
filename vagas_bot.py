@@ -26,6 +26,7 @@ SEEN_FILE = HERE / "seen.json"
 MESSAGES_FILE = HERE / "messages.json"  # IDs das mensagens no Discord, para --limpar
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
 BRT = timezone(timedelta(hours=-3))
+DISCORD_UA = "DiscordBot (https://github.com/eucomoareia/vagas-bot, 1.0)"  # a API de bots recusa UA de navegador
 
 # Termos usados nas fontes que aceitam busca por palavra-chave
 TERMS = ["java", "spring boot", "full stack", "fullstack", "desenvolvedor", "react",
@@ -449,7 +450,7 @@ def discord(url, method="POST", payload=None, headers=None):
     data = json.dumps(payload).encode() if payload is not None else None
     for _ in range(5):
         req = urllib.request.Request(url, data=data, method=method,
-                                     headers={"Content-Type": "application/json", "User-Agent": UA,
+                                     headers={"Content-Type": "application/json", "User-Agent": DISCORD_UA,
                                               **(headers or {})})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
