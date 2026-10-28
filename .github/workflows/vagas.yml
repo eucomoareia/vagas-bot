@@ -9,6 +9,10 @@ on:
         description: "Limpar o canal (apaga as mensagens do bot em vez de buscar vagas)"
         type: boolean
         default: false
+      avisar:
+        description: "Avisar no canal mesmo se não houver vagas novas (usado pelo /search)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -27,6 +31,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          AVISAR_SEM_VAGAS: ${{ inputs.avisar }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Salvar histórico
         run: |

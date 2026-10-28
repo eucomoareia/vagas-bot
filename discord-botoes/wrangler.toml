@@ -6,3 +6,4 @@ compatibility_date = "2026-10-01"
 # Valores públicos do app (Discord Developer Portal > General Information)
 DISCORD_APP_ID = "1565028766575628430"
 DISCORD_PUBLIC_KEY = "10f39527941402c17c077ee0ac6627db0cdda412fa65907d3d6ffa68e8342fe9"
+GITHUB_REPO = "eucomoareia/vagas-bot"

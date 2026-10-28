@@ -4,7 +4,9 @@
 //   ignorar        -> card fica vermelho, status "Sem interesse"
 //   desfazer:<cor> -> volta o card ao normal
 // GET /spacer.png -> imagem transparente que deixa todos os cards com a mesma largura
-// Variáveis (wrangler.toml): DISCORD_PUBLIC_KEY, DISCORD_APP_ID
+// /search -> dispara a busca no GitHub Actions   /wipe -> limpa o canal
+// Variáveis (wrangler.toml): DISCORD_PUBLIC_KEY, DISCORD_APP_ID, GITHUB_REPO
+// Secrets (wrangler secret put): DISCORD_BOT_TOKEN, GITHUB_TOKEN
 
 const STATUS = "📌 Status";
 const MARKS = /^(✅|❌) /;
@@ -81,8 +83,77 @@ function handleClick(i) {
   return json({ type: 6 });
 }
 
+// --- Comandos /search e /wipe -----------------------------------------------
+const API = "https://discord.com/api/v10";
+const ephemeral = (content) => json({ type: 4, data: { content, flags: 64 } });
+
+async function search(env) {
+  // Dispara o workflow do GitHub Actions; ele posta as vagas no canal quando terminar
+  const r = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/vagas.yml/dispatches`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "vagas-bot-worker",
+    },
+    body: JSON.stringify({ ref: "main", inputs: { avisar: true } }),
+  });
+  return r.ok
+    ? ephemeral("🔎 Busca iniciada! As vagas novas aparecem aqui em uns 5 minutos.")
+    : ephemeral(`⚠️ Não consegui iniciar a busca (GitHub respondeu ${r.status}).`);
+}
+
+// Apaga todas as mensagens de bots/webhooks do canal (as suas ficam)
+async function wipe(channel, env) {
+  const bot = { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "Content-Type": "application/json" };
+  const ids = [];
+  let before = "";
+  for (let page = 0; page < 10; page++) {
+    const r = await fetch(`${API}/channels/${channel}/messages?limit=100${before && `&before=${before}`}`, { headers: bot });
+    const msgs = r.ok ? await r.json() : [];
+    if (!msgs.length) break;
+    ids.push(...msgs.filter((m) => m.author?.bot || m.webhook_id).map((m) => m.id));
+    before = msgs[msgs.length - 1].id;
+  }
+  // bulk-delete só aceita mensagens com menos de 14 dias; as antigas vão uma a uma
+  const cutoff = (BigInt(Date.now() - 1420070400000 - 13 * 86400000)) << 22n;
+  const recent = ids.filter((id) => BigInt(id) > cutoff);
+  const old = ids.filter((id) => BigInt(id) <= cutoff);
+  let deleted = 0;
+  for (let k = 0; k < recent.length; k += 100) {
+    const part = recent.slice(k, k + 100);
+    if (part.length === 1) { old.push(part[0]); continue; }
+    const r = await fetch(`${API}/channels/${channel}/messages/bulk-delete`, {
+      method: "POST", headers: bot, body: JSON.stringify({ messages: part }),
+    });
+    if (r.ok) deleted += part.length;
+  }
+  for (const id of old.slice(0, 25)) { // limite de subrequests do Worker
+    const r = await fetch(`${API}/channels/${channel}/messages/${id}`, { method: "DELETE", headers: bot });
+    if (r.ok) deleted++;
+  }
+  const rest = Math.max(0, old.length - 25);
+  return `🧹 ${deleted} mensagem(ns) apagada(s).` + (rest ? ` Faltaram ${rest} antigas, rode /wipe de novo.` : "");
+}
+
+function handleCommand(i, env, ctx) {
+  if (i.data.name === "search") return search(env);
+  if (i.data.name === "wipe") {
+    // Responde "pensando..." só para você e edita a resposta quando terminar
+    ctx.waitUntil(
+      wipe(i.channel_id, env).then((content) =>
+        fetch(`${API}/webhooks/${env.DISCORD_APP_ID}/${i.token}/messages/@original`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content }),
+        })
+      )
+    );
+    return json({ type: 5, data: { flags: 64 } });
+  }
+  return ephemeral("Comando desconhecido.");
+}
+
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     if (req.method === "GET" && new URL(req.url).pathname === "/spacer.png") {
       return new Response(SPACER, { headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=31536000" } });
     }
@@ -91,6 +162,7 @@ export default {
     if (!(await verify(req, body, env.DISCORD_PUBLIC_KEY))) return new Response("assinatura inválida", { status: 401 });
     const i = JSON.parse(body);
     if (i.type === 1) return json({ type: 1 }); // PING de validação do Discord
+    if (i.type === 2) return handleCommand(i, env, ctx); // /search, /wipe
     if (i.type === 3) return handleClick(i); // clique em botão
     return json({ type: 6 });
   },

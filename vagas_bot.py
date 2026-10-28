@@ -584,6 +584,8 @@ def main():
     if not bot and not webhook:
         sys.exit("Defina DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID (com botões) ou DISCORD_WEBHOOK_URL")
     if not new:
+        if bot and os.getenv("AVISAR_SEM_VAGAS") == "true":  # busca pedida pelo /search
+            bot.send({"content": "🔍 Busca concluída: nenhuma vaga nova desde a última vez."})
         return
     sent, msg_ids = set(), []
     try:
